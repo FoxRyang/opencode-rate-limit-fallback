@@ -5,7 +5,6 @@ export { createPlugin as RateLimitFallbackPlugin } from "./src/plugin"
 export type {
   RateLimitFallbackConfig,
   FallbackModel,
-  FallbackModels,
   FallbackModelObject,
 } from "./src/config"
 

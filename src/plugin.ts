@@ -40,6 +40,13 @@ interface PromptBody {
   model?: FallbackModelObject
 }
 
+// Track model information for each session
+const sessionModelInfo = new Map<string, {
+  originalModel: string;
+  currentModel: string;
+  fallbackHistory: Array<{timestamp: number; from: string; to: string; reason: string}>;
+}>();
+
 const sessionStates = new Map<string, SessionState>()
 
 function normalizeFallbackModels(config: FallbackModel | FallbackModel[]): FallbackModelObject[] {
@@ -51,44 +58,65 @@ function getNextFallbackModel(
   fallbackModels: FallbackModelObject[],
   attemptCount: number
 ): { model: FallbackModelObject | null; shouldUseMain: boolean } {
-  // Rotation pattern:
-  // attempt 1: fallback[0]
-  // attempt 2: main
-  // attempt 3: fallback[0]
-  // attempt 4: fallback[1]
-  // attempt 5: fallback[2]
-  // ... continue through all fallbacks
-  
-  // Edge case: if no fallback models configured, always use main
   if (fallbackModels.length === 0) {
     return { model: null, shouldUseMain: true }
   }
   
   if (attemptCount === 1) {
-    // First fallback: try fallback[0]
     return { model: fallbackModels[0], shouldUseMain: false }
   }
   
   if (attemptCount === 2) {
-    // Second attempt: try main again
     return { model: null, shouldUseMain: true }
   }
   
   if (attemptCount === 3) {
-    // Third attempt: try fallback[0] again
     return { model: fallbackModels[0], shouldUseMain: false }
   }
   
-  // For attempts >= 4, cycle through remaining fallbacks
-  // Attempts 1-3 are handled above, so attempt 4 maps to fallbackIndex 1 (4 - 3 = 1)
-  // attempt 4 -> fallback[1], attempt 5 -> fallback[2], etc.
   const fallbackIndex = attemptCount - 3
   if (fallbackIndex < fallbackModels.length) {
     return { model: fallbackModels[fallbackIndex], shouldUseMain: false }
   }
   
-  // If we've exhausted all fallbacks, keep using the last one
   return { model: fallbackModels[fallbackModels.length - 1], shouldUseMain: false }
+}
+
+// Create fallback notice message to be shown in chat
+function createFallbackNoticeParts(
+  originalParts: Array<{ type: "text"; text: string } | { type: "file"; mime: string; filename?: string; url: string } | { type: "agent"; name: string }>,
+  reason: string,
+  fromModel: string,
+  toModel: string | FallbackModelObject,
+  attemptCount: number
+): Array<{ type: "text"; text: string } | { type: "file"; mime: string; filename?: string; url: string } | { type: "agent"; name: string }> {
+  
+  const toModelStr = typeof toModel === "string" 
+    ? toModel 
+    : `${toModel.providerID}/${toModel.modelID}`;
+  
+  const reasonShort = reason.length > 60 ? reason.substring(0, 60) + "..." : reason;
+  
+  const noticeText = `⚠️ **[Rate Limit Fallback]** Attempt #${attemptCount}\n` +
+    `📝 **Reason**: ${reasonShort}\n` +
+    `🔄 **Model Switch**: ${fromModel} → ${toModelStr}\n` +
+    `⏱️ **Time**: ${new Date().toLocaleString()}\n` +
+    `---\n\n`;
+  
+  const newParts = [...originalParts];
+  const firstTextIndex = newParts.findIndex(p => p.type === "text");
+  
+  if (firstTextIndex >= 0) {
+    const firstText = newParts[firstTextIndex] as { type: "text"; text: string };
+    newParts[firstTextIndex] = {
+      type: "text",
+      text: noticeText + firstText.text
+    };
+  } else {
+    newParts.unshift({ type: "text", text: noticeText });
+  }
+  
+  return newParts;
 }
 
 function createPatternMatcher(patterns: string[]) {
@@ -157,7 +185,6 @@ export async function createPlugin(context: PluginInput): Promise<Hooks> {
               state.cooldownEndTime = Date.now() + config.cooldownMs
             }
 
-            // Determine which model to use based on attempt count
             const { model: nextModel, shouldUseMain } = getNextFallbackModel(
               fallbackModels,
               state.attemptCount
@@ -191,10 +218,38 @@ export async function createPlugin(context: PluginInput): Promise<Hooks> {
                 return
               }
 
+              // Track current model information
+              const originalModel = lastUserMessage.info.model 
+                ? `${lastUserMessage.info.model.providerID}/${lastUserMessage.info.model.modelID}`
+                : "main";
+              
+              const targetModel = shouldUseMain ? "main" : 
+                (nextModel ? `${nextModel.providerID}/${nextModel.modelID}` : "unknown");
+
+              // Store model info
+              let modelInfo = sessionModelInfo.get(sessionID);
+              if (!modelInfo) {
+                modelInfo = {
+                  originalModel,
+                  currentModel: targetModel,
+                  fallbackHistory: []
+                };
+              }
+              modelInfo.currentModel = targetModel;
+              modelInfo.fallbackHistory.push({
+                timestamp: Date.now(),
+                from: originalModel,
+                to: targetModel,
+                reason: props.status.message || "rate limit"
+              });
+              sessionModelInfo.set(sessionID, modelInfo);
+
               await logger.info("Found last user message", {
                 sessionID,
                 messageId: lastUserMessage.info.id,
                 totalMessages: messages.length,
+                originalModel,
+                targetModel,
               })
 
               await logger.info("Reverting session", { sessionID, messageId: lastUserMessage.info.id })
@@ -205,7 +260,6 @@ export async function createPlugin(context: PluginInput): Promise<Hooks> {
               await logger.info("Revert completed", {
                 sessionID,
                 revertStatus: revertResponse.response?.status,
-                hasRevertState: !!(revertResponse.data as any)?.revert,
               })
               await new Promise(resolve => setTimeout(resolve, 500))
 
@@ -219,20 +273,27 @@ export async function createPlugin(context: PluginInput): Promise<Hooks> {
                 return
               }
 
-              await logger.info("Sending prompt with fallback model", {
+              // Create parts with fallback notice
+              const partsWithNotice = createFallbackNoticeParts(
+                originalParts,
+                props.status.message || "rate limit",
+                originalModel,
+                shouldUseMain ? "main" : nextModel!,
+                state.attemptCount
+              );
+
+              await logger.info("Sending prompt with fallback model and notice", {
                 sessionID,
-                model: shouldUseMain ? "main" : nextModel,
-                partsCount: originalParts.length,
+                originalModel,
+                targetModel,
                 attemptCount: state.attemptCount,
               })
               
-              // Build the prompt body
               const promptBody: PromptBody = {
                 agent: lastUserMessage.info.agent,
-                parts: originalParts,
+                parts: partsWithNotice,
               }
               
-              // Only specify model if not using main
               if (!shouldUseMain && nextModel) {
                 promptBody.model = nextModel
               }
@@ -256,7 +317,6 @@ export async function createPlugin(context: PluginInput): Promise<Hooks> {
           const sessionID = props.sessionID
           const state = sessionStates.get(sessionID)
           if (state && state.fallbackActive && Date.now() >= state.cooldownEndTime) {
-            // Reset state when cooldown expires and session is idle
             state.fallbackActive = false
             state.attemptCount = 0
             await logger.info("Cooldown expired, fallback reset", { sessionID })
@@ -268,6 +328,7 @@ export async function createPlugin(context: PluginInput): Promise<Hooks> {
         const props = event.properties as { info?: { id?: string } }
         if (props.info?.id) {
           sessionStates.delete(props.info.id)
+          sessionModelInfo.delete(props.info.id)
           await logger.info("Session cleaned up", { sessionID: props.info.id })
         }
       }

@@ -1,14 +1,36 @@
-# opencode-rate-limit-fallback
+# OpenCode Rate Limit Fallback Plugin (Enhanced)
 
-OpenCode plugin that automatically switches to a fallback model when rate limits are hit.
+Enhanced fork of the OpenCode rate-limit-fallback plugin with chat notifications and improved tracking.
+
+Original: [sk2andy/opencode-rate-limit-fallback](https://github.com/sk2andy/opencode-rate-limit-fallback)  
+Based on: [liamvinberg/opencode-rate-limit-fallback](https://github.com/liamvinberg/opencode-rate-limit-fallback)
+
+## ✨ Enhancements
+
+- **💬 Chat Notifications**: Fallback events are now visible in the chat with details
+- **📊 Detailed Tracking**: Track which models were used and fallback history per session
+- **🔄 Multi-Model Support**: Rotate through multiple fallback models
+- **📝 Rich Logging**: File-based logging with structured data
 
 ## Installation
 
-Add to your `opencode.jsonc`:
+### Method 1: Using npm/published version
 
+Add to your `opencode.jsonc`:
 ```json
 {
   "plugin": ["opencode-rate-limit-fallback"]
+}
+```
+
+### Method 2: Local development
+
+Clone this repo and use the local path:
+```json
+{
+  "plugin": [
+    "file:///path/to/opencode-rate-limit-fallback/index.ts"
+  ]
 }
 ```
 
@@ -16,18 +38,14 @@ Add to your `opencode.jsonc`:
 
 Create `rate-limit-fallback.json` in your OpenCode config directory:
 
-**Locations checked (in order):**
-1. `~/.config/opencode/rate-limit-fallback.json`
-2. `~/.config/opencode/config/rate-limit-fallback.json`
-3. `~/.config/opencode/plugins/rate-limit-fallback.json`
-4. `~/.config/opencode/plugin/rate-limit-fallback.json`
-
-**Example config:**
-
 ```json
 {
   "enabled": true,
-  "fallbackModel": "anthropic/claude-opus-4-5",
+  "fallbackModel": [
+    "anthropic/claude-sonnet-4",
+    "openai/gpt-4o",
+    "google/gemini-2.0-flash"
+  ],
   "cooldownMs": 300000,
   "patterns": [
     "rate limit",
@@ -40,114 +58,67 @@ Create `rate-limit-fallback.json` in your OpenCode config directory:
 }
 ```
 
-**Multiple fallback models:**
-
-```json
-{
-  "enabled": true,
-  "fallbackModel": [
-    "anthropic/claude-opus-4-5",
-    "openai/gpt-4",
-    "anthropic/claude-sonnet-3-5"
-  ],
-  "cooldownMs": 300000,
-  "logging": true
-}
-```
-
 ### Options
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `enabled` | boolean | `true` | Enable/disable the plugin |
-| `fallbackModel` | string \| object \| array | `"anthropic/claude-opus-4-5"` | Fallback model(s) (see formats below) |
+| `fallbackModel` | string \| object \| array | `"anthropic/claude-opus-4-5"` | Fallback model(s) - supports single or multiple models |
 | `cooldownMs` | number | `300000` | Cooldown period in ms (default: 5 minutes) |
-| `patterns` | string[] | (see below) | Custom rate limit detection patterns |
+| `patterns` | string[] | See code | Custom rate limit detection patterns |
 | `logging` | boolean | `false` | Enable file-based logging |
 
-### Fallback Model Formats
+### Multi-Model Fallback Chain
 
-**Single model (string format):**
-```json
-{
-  "fallbackModel": "anthropic/claude-opus-4-5"
-}
-```
+When you specify an array of models, the plugin will rotate through them:
 
-**Multiple fallback models (array format):**
-```json
-{
-  "fallbackModel": [
-    "anthropic/claude-opus-4-5",
-    "openai/gpt-4",
-    "anthropic/claude-sonnet-3-5"
-  ]
-}
-```
-
-When using multiple fallback models, the plugin will rotate through them following this pattern:
 1. Main model fails → try first fallback
 2. First fallback fails → try main model again
 3. Main model fails → try first fallback again
 4. First fallback fails → try second fallback
-5. Second fallback fails → try third fallback
-6. And so on until one works or all fallbacks are exhausted
+5. Continue through all configured fallbacks
 
-### Custom Patterns
+## Chat Notification Example
 
-Add your own rate limit detection patterns:
+When a rate limit is detected, the plugin adds a notice to your message:
 
-```json
-{
-  "patterns": [
-    "rate limit",
-    "usage limit",
-    "too many requests",
-    "quota exceeded",
-    "overloaded",
-    "capacity exceeded"
-  ]
-}
+```
+⚠️ **[Rate Limit Fallback]** Attempt #1
+📝 **Reason**: rate limit exceeded for model claude-3-5-sonnet-20241022
+🔄 **Model Switch**: anthropic/claude-opus-4 → openai/gpt-4o
+⏱️ **Time**: 3/31/2026, 5:25:47 PM
+---
+
+[Your original message here...]
 ```
 
-Patterns are case-insensitive and matched against the retry message.
+## How It Works
 
-### Logging
+1. **Detection**: Listens for `session.status` events with retry messages matching configured patterns
+2. **Notification**: Prepends a fallback notice to your original message showing:
+   - Attempt number
+   - Rate limit reason
+   - Model switch details (from → to)
+   - Timestamp
+3. **Fallback**: Reverts the session and resends with the fallback model
+4. **Cooldown**: Prevents spam by ignoring subsequent rate limits during cooldown period
+
+## Logging
 
 When `logging: true`, logs are written to:
 ```
 ~/.local/share/opencode/logs/rate-limit-fallback.log
 ```
 
-Log entries include timestamps and details about rate limit detection, fallback attempts, and errors.
+## Differences from Original
 
-## How It Works
-
-1. **Detection**: Listens for `session.status` events with retry messages matching configured patterns.
-
-2. **Fallback**: When detected:
-   - Aborts the current retry loop
-   - Retrieves the last user message from the session
-   - Reverts the session to before that message (removing the failed attempt)
-   - Re-sends the original message with the fallback model
-   - Starts a cooldown timer
-
-3. **Cooldown**: During the cooldown period, subsequent rate limits on the same session are ignored (prevents spam). After cooldown expires, normal model selection resumes.
-
-This approach keeps the conversation history clean - no "continue" messages or duplicates. The session seamlessly continues with the fallback model as if the rate limit never happened.
-
-## Local Development
-
-For local development, use a `file://` URL in your config:
-
-```json
-{
-  "plugin": [
-    "file:///path/to/opencode-rate-limit-fallback/index.ts"
-  ]
-}
-```
+| Feature | Original | This Fork |
+|---------|----------|-----------|
+| Multi-model fallback | ❌ Single only | ✅ Array support |
+| Chat notifications | ❌ Silent | ✅ Visible notice |
+| Session tracking | ❌ Basic | ✅ Detailed history |
+| Rotation pattern | ❌ None | ✅ Intelligent rotation |
 
 ## License
 
-MIT
+MIT License - see [LICENSE](LICENSE) file.
